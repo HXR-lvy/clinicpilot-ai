@@ -24,6 +24,7 @@
 13. 增加医疗文本结构化摘要接口。
 14. 增加 FastAPI、SQLite、REST 工具和 DeepSeek 调用的 OpenTelemetry 追踪。
 15. 根据用户确认，取消 Docker/Kubernetes 容器化项。
+16. 使用真实 DeepSeek 凭据完成 live 模式、REST 预约、摘要和重启持久化验收。
 
 ## 2. 作业要求分析与结论
 
@@ -350,6 +351,35 @@ agent_tool name=create_booking transport=rest
 - 右侧预约列表能够显示数据库记录。
 - 响应式布局在窄视口下正常工作。
 
+### 6.5 真实 DeepSeek live 验收
+
+使用独立验收数据库和真实 DeepSeek 凭据完成了最终联网测试：
+
+```text
+健康检查
+    -> llm_mode: live
+诊所营业时间问答
+    -> qa_recommendation / live
+皮肤症状推荐
+    -> D103 / T003 / live
+下一次预约查询
+    -> REST GET /api/bookings / live
+多轮预约
+    -> collecting
+    -> awaiting_confirmation
+    -> REST POST /api/bookings
+    -> completed / B1005
+预约列表
+    -> B1001, B1004, B1005
+医疗文本摘要
+    -> 四个结构化字段 / live
+后端重启
+    -> B1005 仍然存在
+```
+
+服务日志确认 DeepSeek Chat Completions 均返回 `200 OK`，会话和预约均使用
+`mode=live`，没有触发 `mock-fallback`。验收数据库位于 Git 忽略的 `.tmp` 目录。
+
 ## 7. 验收中发现并修复的问题
 
 ### 7.1 TF-IDF 向量生成错误
@@ -408,7 +438,7 @@ Git 工作：
 - 当前代码位于 `E:\drkudos`。
 - 本地与远端仓库均使用 `master` 分支。
 - 已完成 Public GitHub 发布。
-- 默认运行模式为 `LLM_MODE=mock`。
+- 本地 `.env` 已配置真实 DeepSeek live 模式；该文件被 Git 忽略，不会进入仓库。
 - 测试和实测产生的额外预约已清理。
 - 当前数据库已恢复为种子状态：
   - 患者 `P001` 只有 `B1001` 和 `B1004`。
@@ -470,9 +500,8 @@ LLM_FALLBACK_TO_MOCK=true
 
 ## 11. 尚未完成或需要外部条件的事项
 
-1. 当前没有有效 DeepSeek API Key，因此真实模型调用由用户后续完成最终联网验收。
-2. 当前仍是固定单患者演示，不包含认证、权限、真实排班冲突、支付或 EHR 集成；这些不属于作业核心要求。
-3. Docker/Kubernetes 容器化已由用户明确取消，不再作为交付项。
+1. 当前仍是固定单患者演示，不包含认证、权限、真实排班冲突、支付或 EHR 集成；这些不属于作业核心要求。
+2. Docker/Kubernetes 容器化已由用户明确取消，不再作为交付项。
 
 ## 12. 交付文件索引
 
