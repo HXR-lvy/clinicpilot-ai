@@ -1,8 +1,9 @@
 # ClinicPilot AI 对话工作总结
 
-> 总结日期：2026-10-26  
-> 工作目录：`E:\drkudos`  
-> 当前提交：`513f19e`（`Build ClinicPilot AI appointment MVP`）
+> 总结日期：2026-10-26
+> 工作目录：`E:\drkudos`
+> Public GitHub：https://github.com/HXR-lvy/clinicpilot-ai
+> 功能完成提交：`68d5e02`（`Complete REST tools summaries and observability`）
 
 ## 1. 本次对话完成的目标
 
@@ -395,14 +396,18 @@ I have your known allergies on file: Penicillin, Peanuts.
 Git 工作：
 
 - 初始化了新仓库。
-- 提交哈希：`513f19e`。
-- 提交信息：`Build ClinicPilot AI appointment MVP`。
+- 初始提交：`513f19e`（`Build ClinicPilot AI appointment MVP`）。
+- 功能完成提交：`68d5e02`（`Complete REST tools summaries and observability`）。
 - 初始提交包含 47 个文件、6116 行新增内容。
+- 已创建并推送 Public GitHub 仓库：
+  `https://github.com/HXR-lvy/clinicpilot-ai`。
+- 远端验证结果为 `visibility=public`、默认分支 `master`。
 
 ## 9. 当前项目状态
 
 - 当前代码位于 `E:\drkudos`。
-- 本地仓库位于 `master` 分支；最终提交和 Public GitHub 状态在发布完成后更新。
+- 本地与远端仓库均使用 `master` 分支。
+- 已完成 Public GitHub 发布。
 - 默认运行模式为 `LLM_MODE=mock`。
 - 测试和实测产生的额外预约已清理。
 - 当前数据库已恢复为种子状态：
