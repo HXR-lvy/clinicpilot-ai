@@ -1,8 +1,10 @@
 # ClinicPilot AI
 
-ClinicPilot AI is a functional take-home MVP for clinic information, grounded treatment recommendations, patient booking lookup, multi-turn appointment collection, and database-backed booking creation.
+ClinicPilot AI is an end-to-end take-home MVP for clinic information, grounded treatment recommendations, patient booking lookup, multi-turn appointment collection, and database-backed booking creation.
 
-The demo uses one predefined patient, `P001` (John Doe), as allowed by the assignment. React renders the chat and a live view of SQLite records; FastAPI owns intent routing, validation, the booking state machine, executable domain tools, and persistence.
+The demo uses one predefined patient, `P001` (John Doe), as allowed by the assignment. React renders the chat and a live view of SQLite records. FastAPI owns intent routing, validation, the booking state machine, and persistence, while the agent's booking query and creation tools call the public REST booking API.
+
+Repository: <https://github.com/HXR-lvy/clinicpilot-ai>
 
 ## Stack
 
@@ -11,9 +13,11 @@ The demo uses one predefined patient, `P001` (John Doe), as allowed by the assig
 - Local TF-IDF retrieval plus exact relational lookups
 - DeepSeek OpenAI-compatible Chat Completions API
 - React 19, TypeScript, Vite
+- REST-backed agent booking tools
+- OpenTelemetry tracing with optional OTLP export
 - Pytest and the TypeScript production build for verification
 
-No Docker or external vector database is required.
+No external vector database or container runtime is required.
 
 ## Prerequisites
 
@@ -41,6 +45,8 @@ If PowerShell blocks activation, invoke the virtual-environment Python directly 
 ```
 
 The default `.env.example` runs `LLM_MODE=mock`, so the complete workflow works without a model key.
+
+`TOOL_API_BASE_URL` defaults to `http://127.0.0.1:8000`. The backend process must be reachable at that address because booking lookup and creation intentionally execute through the public REST interface.
 
 ## 2. Initialize the database
 
@@ -124,6 +130,7 @@ The profile question `Can I book an appointment for my peanut allergy?` uses the
 POST /api/chat
 GET  /api/bookings?patient_id=P001
 POST /api/bookings
+POST /api/summarize
 GET  /api/health
 ```
 
@@ -142,6 +149,36 @@ Example booking:
 
 Unknown entities return `404`; invalid patient/doctor/treatment relationships and payload validation errors return `422`. Reusing the same `draft_id` returns the already-created booking rather than duplicating it.
 
+If the REST booking tool cannot reach the service, `/api/chat` returns `503`. A failed confirmed booking retains its `awaiting_confirmation` draft so the user can retry without losing doctor, treatment, date, or time.
+
+## Transcript summarizer
+
+```powershell
+$body = @{
+  transcript = "Patient: sore throat for three days. Diagnosis: viral pharyngitis. Medication: ibuprofen. Doctor instructions: rest."
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://localhost:8000/api/summarize `
+  -ContentType application/json `
+  -Body $body
+```
+
+The response always contains `chief_complaint`, `diagnosis`, `medication`, and `doctor_instructions` as strings. Missing values are empty strings. The endpoint is stateless and does not persist the transcript or summary. It structures supplied information and does not replace diagnosis by a clinician.
+
+## Observability
+
+Set `OTEL_ENABLED=true` to emit traces. Without an OTLP endpoint, enabled traces are written to the backend console through the OpenTelemetry console exporter. Any OTLP-compatible backend can be used:
+
+```text
+OTEL_ENABLED=true
+OTEL_SERVICE_NAME=clinicpilot-ai
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+Traces cover FastAPI requests, SQLAlchemy operations, REST booking tools, and DeepSeek routing, answers, and summaries. Model spans include latency, model name, fallback status, and token counts. Full prompts, patient messages, and transcripts are not added as trace attributes.
+
 ## Verification
 
 Backend tests:
@@ -158,7 +195,7 @@ Set-Location frontend
 npm run build
 ```
 
-The backend suite covers seed data, next-booking lookup, the full multi-turn booking flow, restart persistence, incompatible doctor/treatment pairs, idempotent creation, emergency handling, retrieval, dates, and confirmation phrases.
+The backend suite covers seed data, next-booking lookup, REST tool contracts, `404`/`422`/`503` mapping, retry after a failed REST booking, the full multi-turn booking flow, restart persistence, incompatible doctor/treatment pairs, idempotent creation, emergency handling, retrieval, summaries, dates, confirmation phrases, and OpenTelemetry spans.
 
 ## Project layout
 
@@ -177,4 +214,5 @@ TECH_DOC.md        architecture and design rationale
 - Schedule conflicts, payments, cancellations, and real EHR integration are not implemented, as allowed by the assignment.
 - Times are stored as clinic-local wall-clock values with no timezone conversion.
 - The assistant is a clinic information and booking tool, not a diagnostic or prescribing system.
+- The fixed `P001` profile and lack of authentication are deliberate demo constraints.
 

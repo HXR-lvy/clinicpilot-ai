@@ -6,12 +6,15 @@ from datetime import date, time
 from typing import Literal
 
 from openai import OpenAI
+from opentelemetry import trace
+from opentelemetry.trace import Span
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
 from .config import Settings
+from .observability import record_span_error
 from .retrieval import KnowledgeRetriever
-from .schemas import Intent
+from .schemas import Intent, TranscriptSummaryResponse
 from .temporal import extract_date, extract_time, is_affirmative, is_negative
 
 
@@ -31,10 +34,15 @@ class RouteDecision(BaseModel):
 
 
 class DeepSeekClient:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        tracer: trace.Tracer | None = None,
+    ):
         if not settings.deepseek_api_key:
             raise LLMUnavailableError("DEEPSEEK_API_KEY is not configured")
         self.settings = settings
+        self.tracer = tracer or trace.get_tracer("clinicpilot-ai")
         self.client = OpenAI(
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,
@@ -86,24 +94,41 @@ Catalog: {json.dumps(catalog, ensure_ascii=False)}
 Active booking draft: {json.dumps(draft, default=str, ensure_ascii=False) if draft else "null"}
 Recent conversation: {json.dumps(history[-8:], ensure_ascii=False)}
 """.strip()
-        try:
-            response = self.client.chat.completions.create(
-                model=self.settings.deepseek_model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": message},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0,
-                max_tokens=700,
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-            content = response.choices[0].message.content or "{}"
-            return RouteDecision.model_validate_json(_strip_code_fence(content))
-        except (ValidationError, json.JSONDecodeError, ValueError) as exc:
-            raise LLMUnavailableError(f"DeepSeek returned an invalid route: {exc}") from exc
-        except Exception as exc:
-            raise LLMUnavailableError(f"DeepSeek routing request failed: {exc}") from exc
+        with self.tracer.start_as_current_span(
+            "gen_ai.deepseek.route",
+            attributes={
+                "gen_ai.system": "deepseek",
+                "gen_ai.operation.name": "route",
+                "gen_ai.request.model": self.settings.deepseek_model,
+            },
+        ) as span:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.settings.deepseek_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": message},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    max_tokens=700,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                _record_usage(span, response)
+                content = response.choices[0].message.content or "{}"
+                return RouteDecision.model_validate_json(_strip_code_fence(content))
+            except (ValidationError, json.JSONDecodeError, ValueError) as exc:
+                record_span_error(span, exc)
+                raise LLMUnavailableError(
+                    f"DeepSeek returned an invalid route: {exc}"
+                ) from exc
+            except LLMUnavailableError:
+                raise
+            except Exception as exc:
+                record_span_error(span, exc)
+                raise LLMUnavailableError(
+                    f"DeepSeek routing request failed: {exc}"
+                ) from exc
 
     def answer(
         self,
@@ -124,28 +149,86 @@ Keep the response under 180 words and use short paragraphs or bullets.
             "patient_context": patient_context,
             "evidence": evidence,
         }
-        try:
-            response = self.client.chat.completions.create(
-                model=self.settings.deepseek_model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": f"Question: {message}\n\nGrounding data:\n{json.dumps(payload, ensure_ascii=False, default=str)}",
-                    },
-                ],
-                temperature=0.2,
-                max_tokens=500,
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-            content = (response.choices[0].message.content or "").strip()
-            if not content:
-                raise LLMUnavailableError("DeepSeek returned an empty answer")
-            return content
-        except LLMUnavailableError:
-            raise
-        except Exception as exc:
-            raise LLMUnavailableError(f"DeepSeek answer request failed: {exc}") from exc
+        with self.tracer.start_as_current_span(
+            "gen_ai.deepseek.answer",
+            attributes={
+                "gen_ai.system": "deepseek",
+                "gen_ai.operation.name": "answer",
+                "gen_ai.request.model": self.settings.deepseek_model,
+            },
+        ) as span:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.settings.deepseek_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {
+                            "role": "user",
+                            "content": f"Question: {message}\n\nGrounding data:\n{json.dumps(payload, ensure_ascii=False, default=str)}",
+                        },
+                    ],
+                    temperature=0.2,
+                    max_tokens=500,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                _record_usage(span, response)
+                content = (response.choices[0].message.content or "").strip()
+                if not content:
+                    raise LLMUnavailableError("DeepSeek returned an empty answer")
+                return content
+            except LLMUnavailableError as exc:
+                record_span_error(span, exc)
+                raise
+            except Exception as exc:
+                record_span_error(span, exc)
+                raise LLMUnavailableError(
+                    f"DeepSeek answer request failed: {exc}"
+                ) from exc
+
+    def summarize(self, transcript: str) -> TranscriptSummaryResponse:
+        system = """
+Extract a structured medical summary from the transcript.
+Return exactly one JSON object with these string fields:
+chief_complaint, diagnosis, medication, doctor_instructions.
+Use an empty string when a field is not stated. Do not infer or invent clinical facts.
+""".strip()
+        with self.tracer.start_as_current_span(
+            "gen_ai.deepseek.summarize",
+            attributes={
+                "gen_ai.system": "deepseek",
+                "gen_ai.operation.name": "summarize",
+                "gen_ai.request.model": self.settings.deepseek_model,
+            },
+        ) as span:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.settings.deepseek_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": transcript},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    max_tokens=700,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                _record_usage(span, response)
+                content = response.choices[0].message.content or "{}"
+                return TranscriptSummaryResponse.model_validate_json(
+                    _strip_code_fence(content)
+                )
+            except (ValidationError, json.JSONDecodeError, ValueError) as exc:
+                record_span_error(span, exc)
+                raise LLMUnavailableError(
+                    f"DeepSeek returned an invalid summary: {exc}"
+                ) from exc
+            except LLMUnavailableError:
+                raise
+            except Exception as exc:
+                record_span_error(span, exc)
+                raise LLMUnavailableError(
+                    f"DeepSeek summary request failed: {exc}"
+                ) from exc
 
 
 class MockDecisionEngine:
@@ -262,4 +345,16 @@ def _strip_code_fence(content: str) -> str:
         stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
         stripped = re.sub(r"\s*```$", "", stripped)
     return stripped
+
+
+def _record_usage(span: Span, response: object) -> None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if isinstance(prompt_tokens, int):
+        span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
+    if isinstance(completion_tokens, int):
+        span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
 

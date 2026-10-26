@@ -9,16 +9,19 @@ React workbench
   POST /api/chat
         |
         v
-FastAPI ChatService
+FastAPI ChatService and state machine
   |-- patient context loader
   |-- DeepSeek structured router or deterministic mock router
-  |-- explicit booking state machine
   |-- validated domain tools
         |-- search_clinic_knowledge
-        |-- get_patient_bookings
         |-- upsert_booking_draft
-        |-- create_booking
         |-- cancel_booking_draft
+        |
+        | REST agent tools
+        |   GET  /api/bookings
+        |   POST /api/bookings
+        v
+FastAPI public booking service
         |
         v
 SQLite
@@ -74,12 +77,14 @@ The active draft is stored in `booking_drafts`, not only in process memory. Each
 | Tool | Responsibility | Safety rule |
 |---|---|---|
 | `search_clinic_knowledge` | TF-IDF retrieval plus exact payloads | Returns source IDs and never invents a service |
-| `get_patient_bookings` | Reads current patient bookings | Always queries SQLite, never relies on model memory |
+| `get_patient_bookings` | Calls `GET /api/bookings` over REST | Always queries persisted records, never relies on model memory |
 | `upsert_booking_draft` | Persists partial booking slots | Validates IDs and doctor/treatment compatibility |
-| `create_booking` | Creates the final appointment | Requires complete draft and confirmation-aware workflow |
+| `create_booking` | Calls `POST /api/bookings` over REST | Requires complete draft and explicit confirmation |
 | `cancel_booking_draft` | Marks a rejected draft cancelled | Does not delete history |
 
-The same `create_booking` application service backs the public `POST /api/bookings` route. This avoids a fragile HTTP loopback call while preserving one validated booking interface for the agent and API clients. A `draft_id` is unique on the persisted booking, making repeated tool retries idempotent.
+The agent does not write booking rows through the ORM. Its `get_patient_bookings` and `create_booking` tools use an injected `httpx` client against `TOOL_API_BASE_URL`. The public API validates the request, resolves doctor/treatment compatibility, and commits the record. A `draft_id` is unique on the persisted booking, so a retry after an ambiguous network failure returns the existing booking rather than duplicating it.
+
+The client maps `404` to a domain-not-found error, `422` to a validation error, and transport, malformed-response, or server failures to `BookingToolsUnavailableError`. The public `/api/chat` route reports that condition as `503`. When creation fails after confirmation, the conversation and draft remain in `awaiting_confirmation`, allowing a later retry.
 
 ## 4. Retrieval strategy
 
@@ -130,6 +135,21 @@ Default patient context is loaded from `patients`, `patient_bookings`, and `pati
 
 Response fields: `conversation_id`, `message`, `intent`, `state`, `sources`, `draft`, `booking`, `requires_confirmation`, and `llm_mode`.
 
+### `POST /api/summarize`
+
+Accepts a non-empty `transcript` of at most 20,000 characters and returns exactly:
+
+```json
+{
+  "chief_complaint": "",
+  "diagnosis": "",
+  "medication": "",
+  "doctor_instructions": ""
+}
+```
+
+Live mode asks DeepSeek for JSON and validates the result. Mock mode uses deterministic label extraction. The endpoint is stateless and never persists the transcript or summary. It is an information structuring tool, not a diagnosis service.
+
 ### `POST /api/bookings`
 
 Accepts patient, doctor, treatment, ISO date, time, optional notes, and optional draft ID. Returns `201` plus the persisted booking. Unknown entities map to `404`; invalid relationships and payloads map to `422`; repeated draft IDs return the original record.
@@ -149,13 +169,20 @@ Checks database connectivity and exposes the configured model mode.
 - Incompatible doctor/treatment pairs are rejected before insert.
 - Missing booking slots produce focused follow-up prompts and preserve the draft.
 - Only an explicit confirmation creates an appointment; a clear rejection cancels the draft.
-- Network and JSON failures can use deterministic fallback routing, preserving the core demo.
+- Network and JSON model failures can use deterministic fallback routing, preserving the core demo.
+- REST booking unavailability returns `503`; a failed create leaves the confirmed draft intact for retry.
 - Chest pain, breathing difficulty, severe bleeding, unconsciousness, and similar phrases return clinic emergency guidance and stop booking.
 - The assistant is prompted as an information and booking system, not a diagnostic or prescribing system.
 
-## 8. Verification and future work
+## 8. Observability
 
-The Pytest suite validates seed counts, next-appointment selection, multi-turn collection, restart persistence, incompatible pairs, idempotency, emergency behavior, retrieval, date parsing, and confirmation parsing. The frontend production build validates TypeScript and bundling.
+OpenTelemetry is opt-in through `OTEL_ENABLED`. FastAPI requests and SQLAlchemy operations are instrumented, and the REST booking client and DeepSeek adapter create explicit spans. Model spans record operation, model, duration, token usage, status, and fallback events. Prompts, user messages, and transcripts are not attached to spans.
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export spans to an external OTLP-compatible collector. Without an endpoint, enabled traces use the console exporter; when tracing is disabled, OpenTelemetry remains a no-op. `TOOL_API_BASE_URL` defaults to `http://127.0.0.1:8000`, so Agent booking operations traverse the real REST endpoint.
+
+## 9. Verification and future work
+
+Pytest validates seed counts, next-appointment selection, the REST tool wire contract, error mapping, retry-safe drafts, multi-turn collection, persistence, incompatible pairs, idempotency, emergency behavior, retrieval, summaries, date parsing, confirmation parsing, and OpenTelemetry spans. The frontend production build validates TypeScript and bundling.
 
 For production, the next steps would be authentication, authorization, per-clinic timezone handling, transactional schedule locking, deletion/cancellation policies, audit logging, encrypted PHI storage, rate limiting, and integration with a real EHR or MCP server. The current `P001` assumption is explicit and limited to the take-home demo.
 

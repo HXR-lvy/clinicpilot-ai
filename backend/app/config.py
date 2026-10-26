@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 30.0
     llm_fallback_to_mock: bool = True
 
+    tool_api_base_url: str = "http://127.0.0.1:8000"
+    tool_api_timeout_seconds: float = 10.0
+
+    otel_enabled: bool = False
+    otel_service_name: str = "clinicpilot-ai"
+    otel_exporter_otlp_endpoint: str | None = None
+
     default_patient_id: str = "P001"
     demo_today: date | None = None
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

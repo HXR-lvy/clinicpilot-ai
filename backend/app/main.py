@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from opentelemetry import trace
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
+from .booking_tools import (
+    BookingToolClient,
+    BookingToolsUnavailableError,
+    HttpBookingToolClient,
+)
 from .chat import ChatService
 from .config import Settings
 from .database import Base, build_engine, build_session_factory, session_dependency
+from .llm import LLMUnavailableError
+from .observability import setup_telemetry
 from .repositories import (
     DomainNotFoundError,
     DomainValidationError,
@@ -25,8 +34,11 @@ from .schemas import (
     ChatRequest,
     ChatResponse,
     HealthResponse,
+    TranscriptSummaryRequest,
+    TranscriptSummaryResponse,
 )
 from .seed import seed_database
+from .summary import SummaryService
 
 
 logging.basicConfig(
@@ -35,10 +47,28 @@ logging.basicConfig(
 )
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    booking_tool_client: BookingToolClient | None = None,
+    booking_tool_client_factory: (
+        Callable[[sessionmaker[Session]], BookingToolClient] | None
+    ) = None,
+    tracer_provider: trace.TracerProvider | None = None,
+) -> FastAPI:
     app_settings = settings or Settings()
     engine = build_engine(app_settings)
     session_factory = build_session_factory(engine)
+    telemetry = setup_telemetry(app_settings, tracer_provider=tracer_provider)
+    tool_client = booking_tool_client
+    if tool_client is None and booking_tool_client_factory is not None:
+        tool_client = booking_tool_client_factory(session_factory)
+    if tool_client is None:
+        tool_client = HttpBookingToolClient(
+            base_url=app_settings.tool_api_base_url,
+            timeout_seconds=app_settings.tool_api_timeout_seconds,
+            tracer=telemetry.tracer,
+        )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -46,7 +76,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with session_factory() as session:
             seed_database(session, app_settings.mock_data_dir)
         yield
+        application.state.booking_tool_client.close()
         engine.dispose()
+        telemetry.shutdown()
 
     application = FastAPI(
         title=app_settings.app_name,
@@ -57,6 +89,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = app_settings
     application.state.session_factory = session_factory
     application.state.engine = engine
+    application.state.booking_tool_client = tool_client
+    application.state.telemetry = telemetry
     application.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origin_list,
@@ -76,6 +110,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def handle_validation(_, exc: DomainValidationError):
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    @application.exception_handler(BookingToolsUnavailableError)
+    async def handle_tool_unavailable(_, exc: BookingToolsUnavailableError):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    @application.exception_handler(LLMUnavailableError)
+    async def handle_llm_unavailable(_, exc: LLMUnavailableError):
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     @application.get("/api/health", response_model=HealthResponse)
     def health(session: Session = Depends(get_session)):
         session.execute(text("SELECT 1"))
@@ -88,7 +130,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post("/api/chat", response_model=ChatResponse)
     def chat(request: ChatRequest, session: Session = Depends(get_session)):
         request.patient_id = request.patient_id or app_settings.default_patient_id
-        return ChatService(session, app_settings).handle(request)
+        return ChatService(
+            session,
+            app_settings,
+            application.state.booking_tool_client,
+            tracer=telemetry.tracer,
+        ).handle(request)
+
+    @application.post("/api/summarize", response_model=TranscriptSummaryResponse)
+    def summarize(request: TranscriptSummaryRequest):
+        return SummaryService(app_settings, tracer=telemetry.tracer).summarize(
+            request.transcript
+        )
 
     @application.get("/api/bookings", response_model=BookingListResponse)
     def bookings(
@@ -117,6 +170,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return booking
 
+    telemetry.instrument(application, engine)
     return application
 
 

@@ -101,3 +101,22 @@ class HealthResponse(BaseModel):
     database: str
     llm_mode: str
 
+
+class TranscriptSummaryRequest(BaseModel):
+    transcript: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("transcript")
+    @classmethod
+    def strip_transcript(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("transcript cannot be blank")
+        return value
+
+
+class TranscriptSummaryResponse(BaseModel):
+    chief_complaint: str = ""
+    diagnosis: str = ""
+    medication: str = ""
+    doctor_instructions: str = ""
+

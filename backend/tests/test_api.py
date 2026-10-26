@@ -5,7 +5,6 @@ from datetime import date
 from fastapi.testclient import TestClient
 
 from app.config import Settings
-from app.main import create_app
 
 
 def test_health_and_seeded_bookings(client: TestClient):
@@ -34,10 +33,11 @@ def test_next_appointment_lookup_uses_database(client: TestClient):
     assert payload["intent"] == "booking_lookup"
     assert "B1001" in payload["message"]
     assert "2026-11-05" in payload["message"]
+    assert client.app.state.booking_tool_client.calls == ["get_patient_bookings"]
 
 
 def test_multi_turn_booking_persists_and_survives_restart(
-    client: TestClient, settings: Settings
+    client: TestClient, settings: Settings, app_factory
 ):
     first = client.post(
         "/api/chat",
@@ -81,12 +81,13 @@ def test_multi_turn_booking_persists_and_survives_restart(
     assert booking["booking_id"] == "B1005"
     assert booking["booking_date"] == "2026-11-20"
     assert booking["booking_time"] == "10:00:00"
+    assert "create_booking" in client.app.state.booking_tool_client.calls
 
     bookings = client.get("/api/bookings", params={"patient_id": "P001"}).json()["bookings"]
     assert len(bookings) == 3
     assert any(item["booking_id"] == "B1005" for item in bookings)
 
-    restarted_app = create_app(settings)
+    restarted_app = app_factory(settings)
     with TestClient(restarted_app) as restarted_client:
         persisted = restarted_client.get(
             "/api/bookings", params={"patient_id": "P001"}
@@ -169,9 +170,11 @@ def test_allergy_booking_prompt_uses_patient_context(client: TestClient):
     assert payload["draft"]["treatment_id"] == "T001"
 
 
-def test_live_mode_without_key_falls_back_deterministically(settings: Settings):
+def test_live_mode_without_key_falls_back_deterministically(
+    settings: Settings, app_factory
+):
     live_settings = settings.model_copy(update={"llm_mode": "live"})
-    application = create_app(live_settings)
+    application = app_factory(live_settings)
     with TestClient(application) as live_client:
         response = live_client.post(
             "/api/chat",
@@ -180,4 +183,62 @@ def test_live_mode_without_key_falls_back_deterministically(settings: Settings):
     assert response.status_code == 200
     assert response.json()["llm_mode"] == "mock-fallback"
     assert "B1001" in response.json()["message"]
+
+
+def test_booking_lookup_tool_unavailable_returns_503(client: TestClient):
+    tool_client = client.app.state.booking_tool_client
+    tool_client.fail_lookup = True
+
+    response = client.post(
+        "/api/chat",
+        json={"message": "When is my next appointment?", "patient_id": "P001"},
+    )
+
+    assert response.status_code == 503
+    assert "unavailable" in response.json()["detail"].lower()
+
+
+def test_failed_rest_booking_retains_draft_for_retry(client: TestClient):
+    first = client.post(
+        "/api/chat",
+        json={
+            "message": "Book a general health checkup with Dr. Sarah Jenkins.",
+            "patient_id": "P001",
+        },
+    )
+    conversation_id = first.json()["conversation_id"]
+    second = client.post(
+        "/api/chat",
+        json={
+            "message": "November 20, 2026 at 10:00 AM.",
+            "conversation_id": conversation_id,
+            "patient_id": "P001",
+        },
+    )
+    assert second.json()["state"] == "awaiting_confirmation"
+
+    tool_client = client.app.state.booking_tool_client
+    tool_client.fail_create = True
+    failed = client.post(
+        "/api/chat",
+        json={
+            "message": "yes",
+            "conversation_id": conversation_id,
+            "patient_id": "P001",
+        },
+    )
+    assert failed.status_code == 503
+
+    tool_client.fail_create = False
+    retried = client.post(
+        "/api/chat",
+        json={
+            "message": "yes",
+            "conversation_id": conversation_id,
+            "patient_id": "P001",
+        },
+    )
+    assert retried.status_code == 200
+    assert retried.json()["state"] == "completed"
+    assert retried.json()["booking"]["booking_id"] == "B1005"
 

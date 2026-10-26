@@ -4,11 +4,14 @@ import json
 import logging
 import re
 from datetime import date
+from time import perf_counter
 from uuid import uuid4
 
+from opentelemetry import trace
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .booking_tools import BookingToolClient
 from .config import Settings
 from .llm import (
     DeepSeekClient,
@@ -21,19 +24,17 @@ from .repositories import (
     DomainNotFoundError,
     DomainValidationError,
     append_message,
-    create_booking,
     doctor_supports_treatment,
     get_doctor,
     get_or_create_conversation,
     get_patient,
     get_treatment,
-    list_bookings,
-    next_upcoming_booking,
     patient_context,
     recent_messages,
 )
 from .retrieval import KnowledgeDocument, KnowledgeRetriever, RetrievalResult
 from .schemas import (
+    BookingCreateRequest,
     BookingDraftOut,
     BookingOut,
     ChatRequest,
@@ -49,11 +50,34 @@ logger = logging.getLogger(__name__)
 class AgentToolbox:
     """Validated domain tools exposed to the conversational orchestrator."""
 
-    def __init__(self, session: Session, settings: Settings, patient_id: str):
+    def __init__(
+        self,
+        session: Session,
+        settings: Settings,
+        patient_id: str,
+        booking_tools: BookingToolClient,
+    ):
         self.session = session
         self.settings = settings
         self.patient_id = patient_id
+        self.booking_tools = booking_tools
         self.calls: list[str] = []
+        self.events: list[dict[str, object]] = []
+
+    def _record_event(
+        self,
+        name: str,
+        started: float,
+        *,
+        status: str,
+    ) -> None:
+        self.events.append(
+            {
+                "tool": name,
+                "status": status,
+                "duration_ms": round((perf_counter() - started) * 1000, 2),
+            }
+        )
 
     def search_clinic_knowledge(self, query: str) -> RetrievalResult:
         self.calls.append("search_clinic_knowledge")
@@ -61,9 +85,23 @@ class AgentToolbox:
 
     def get_patient_bookings(self) -> tuple[list[BookingOut], BookingOut | None]:
         self.calls.append("get_patient_bookings")
+        started = perf_counter()
+        try:
+            bookings = self.booking_tools.get_patient_bookings(self.patient_id)
+        except Exception:
+            self._record_event("get_patient_bookings", started, status="error")
+            raise
+        self._record_event("get_patient_bookings", started, status="ok")
         today = self.settings.demo_today or date.today()
-        bookings = list_bookings(self.session, self.patient_id)
-        return bookings, next_upcoming_booking(self.session, self.patient_id, today)
+        next_booking = next(
+            (
+                booking
+                for booking in bookings
+                if booking.status == "Confirmed" and booking.booking_date >= today
+            ),
+            None,
+        )
+        return bookings, next_booking
 
     def get_active_draft(self, conversation_id: str) -> BookingDraft | None:
         return self.session.scalar(
@@ -137,16 +175,23 @@ class AgentToolbox:
             (draft.doctor_id, draft.treatment_id, draft.booking_date, draft.booking_time)
         ):
             raise DomainValidationError("The booking draft is incomplete")
-        booking, _ = create_booking(
-            self.session,
-            patient_id=self.patient_id,
-            doctor_id=draft.doctor_id,
-            treatment_id=draft.treatment_id,
-            booking_date=draft.booking_date,
-            booking_time=draft.booking_time,
-            notes=draft.notes,
-            draft_id=draft.draft_id,
-        )
+        started = perf_counter()
+        try:
+            booking = self.booking_tools.create_booking(
+                BookingCreateRequest(
+                    patient_id=self.patient_id,
+                    doctor_id=draft.doctor_id,
+                    treatment_id=draft.treatment_id,
+                    booking_date=draft.booking_date,
+                    booking_time=draft.booking_time,
+                    notes=draft.notes,
+                    draft_id=draft.draft_id,
+                )
+            )
+        except Exception:
+            self._record_event("create_booking", started, status="error")
+            raise
+        self._record_event("create_booking", started, status="ok")
         draft.status = "completed"
         self.session.commit()
         return booking
@@ -158,16 +203,29 @@ class AgentToolbox:
 
 
 class ChatService:
-    def __init__(self, session: Session, settings: Settings):
+    def __init__(
+        self,
+        session: Session,
+        settings: Settings,
+        booking_tools: BookingToolClient,
+        tracer: trace.Tracer | None = None,
+    ):
         self.session = session
         self.settings = settings
+        self.booking_tools = booking_tools
+        self.tracer = tracer or trace.get_tracer("clinicpilot-ai")
 
     def handle(self, request: ChatRequest) -> ChatResponse:
         patient = get_patient(self.session, request.patient_id)
         conversation = get_or_create_conversation(
             self.session, request.conversation_id, request.patient_id
         )
-        toolbox = AgentToolbox(self.session, self.settings, request.patient_id)
+        toolbox = AgentToolbox(
+            self.session,
+            self.settings,
+            request.patient_id,
+            self.booking_tools,
+        )
         active_draft = toolbox.get_active_draft(conversation.conversation_id)
         context = patient_context(self.session, request.patient_id)
         catalog = self._catalog()
@@ -215,6 +273,7 @@ class ChatService:
                     "state": response.state,
                     "source_ids": [source.id for source in response.sources],
                     "llm_mode": response.llm_mode,
+                    "tool_events": toolbox.events,
                 }
             ),
         )
@@ -252,7 +311,7 @@ class ChatService:
             )
 
         try:
-            live_client = DeepSeekClient(self.settings)
+            live_client = DeepSeekClient(self.settings, tracer=self.tracer)
             draft_payload = (
                 BookingDraftOut.model_validate(draft).model_dump(mode="json")
                 if draft
@@ -274,6 +333,7 @@ class ChatService:
             if not self.settings.llm_fallback_to_mock:
                 raise
             logger.warning("DeepSeek routing degraded to mock: %s", exc)
+            trace.get_current_span().add_event("deepseek.route.fallback")
             return (
                 mock_engine.route(
                     message=message,
@@ -356,7 +416,7 @@ class ChatService:
         if llm_mode == "live":
             try:
                 evidence = self._evidence_payload(retrieval)
-                message = DeepSeekClient(self.settings).answer(
+                message = DeepSeekClient(self.settings, tracer=self.tracer).answer(
                     message=request.message,
                     patient_context=context,
                     evidence=evidence,
@@ -365,6 +425,7 @@ class ChatService:
                 if not self.settings.llm_fallback_to_mock:
                     raise
                 logger.warning("DeepSeek answer degraded to mock: %s", exc)
+                trace.get_current_span().add_event("deepseek.answer.fallback")
                 message = self._mock_knowledge_answer(
                     request.message, retrieval, context
                 )
@@ -490,7 +551,13 @@ class ChatService:
         if decision.confirmation == "yes" and active_draft is not None:
             conversation.state = "booking"
             self.session.commit()
-            booking = toolbox.create_booking_from_draft(draft)
+            try:
+                booking = toolbox.create_booking_from_draft(draft)
+            except Exception:
+                draft.status = "awaiting_confirmation"
+                conversation.state = "awaiting_confirmation"
+                self.session.commit()
+                raise
             conversation.state = "completed"
             self.session.commit()
             return ChatResponse(
